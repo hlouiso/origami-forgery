@@ -1,0 +1,18 @@
+# Build artefacts
+build/
+*.o
+*.out
+
+# Never commit the Origami submission (separately licensed, not redistributed)
+Origami/
+Origami.zip
+**/Reference_Implementation/
+**/Optimized_Implementation/
+**/Test_Vectors/
+
+# Local challenge scratch (seeds, handoffs, forged signatures)
+*.private
+*seed*.txt
+handoff*.txt
+forged_sig*.txt
+*.hex
