@@ -164,8 +164,10 @@ static int forge(const ph_expanded_PK*pkx,uint8_t*sig,const uint8_t*digest,size_
             const int non_cnt=zn->n_offset+zn->flat_v;
             const int oil_start=zn->n_offset+zn->flat_v;
             const int64_t zbase=elig_before(z,zone);
+            /* Without vinegar, local retries repeat the same system. */
+            const int max_local_attempts=zn->flat_v>0?256:1;
             int solved=0;
-            for(int att=0; att<256 && !solved; att++){
+            for(int att=0; att<max_local_attempts && !solved; att++){
                 /* choose this zone's vinegar freely (any values) */
                 gf_stream_t vs; gf_stream_init(&vs,pkx->pk_seed,SEED_LENGTH_PUBLIC,"forge-vin",
                                                (uint32_t)zone,(uint32_t)att,(uint32_t)outer,NULL,0);

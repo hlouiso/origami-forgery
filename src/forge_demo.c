@@ -14,10 +14,16 @@
 //   gcc -std=c11 -O3 -I<dir> -DORIGAMI_OPT=REF forge.c <dir>/origami_ref.o \
 //       <dir>/symmetric_iccs.o <dir>/auxfunc.o <dir>/aes.o <dir>/drng.o -o forge128
 
+#ifdef ORIGAMI_MEASURE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef ORIGAMI_MEASURE
+#include <time.h>
+#endif
 
 #include "origami.h"
 #include "origami_gf.h"     // gf ops, expand_gf, compress_gf, init_gf_tables (static)
@@ -28,6 +34,24 @@
 
 #ifndef ALGSTR
 #define ALGSTR "Origami"
+#endif
+
+#ifdef ORIGAMI_MEASURE
+static unsigned long long metric_calls, metric_outer_passes;
+static unsigned long long metric_tail_restarts, metric_main_restarts, metric_verify_calls;
+static unsigned long long metric_verify_accepted_calls;
+static double metric_forge_seconds, metric_verify_seconds, metric_verify_accepted_seconds;
+static double metric_now(void){
+    struct timespec ts;
+    if(clock_gettime(CLOCK_MONOTONIC,&ts)!=0){perror("clock_gettime");exit(1);}
+    return (double)ts.tv_sec+(double)ts.tv_nsec*1e-9;
+}
+static void metric_print(void){
+    printf("METRICS calls=%llu outer_passes=%llu tail_restarts=%llu main_restarts=%llu forge_s=%.9f verify_calls=%llu verify_s=%.9f verify_accepted_calls=%llu verify_accepted_s=%.9f\n",
+           metric_calls,metric_outer_passes,metric_tail_restarts,metric_main_restarts,
+           metric_forge_seconds,metric_verify_calls,metric_verify_seconds,
+           metric_verify_accepted_calls,metric_verify_accepted_seconds);
+}
 #endif
 
 #define GF_STREAM_BUF_BYTES 4096
@@ -148,6 +172,9 @@ static int solve_free0(gf_t*x,const gf_t*Ain,const gf_t*rhs,int rows,int cols){
 /* the forgery: build sigma from pk only */
 static int forge(const ph_expanded_PK*pkx,uint8_t*sig,const uint8_t*digest,size_t len,
                  const uint8_t salt[BYTES_SALT]){
+#ifdef ORIGAMI_MEASURE
+    metric_calls++;
+#endif
     zone_info_t z[ORIGAMI_TOTAL_ZONES]; zones_init(z);
     rsched_t rs; rsched_init(&rs,z,pkx->pk_seed);
     gf_t target[ORIGAMI_M]; hash_to_field(target,digest,len,salt);
@@ -157,6 +184,9 @@ static int forge(const ph_expanded_PK*pkx,uint8_t*sig,const uint8_t*digest,size_
     gf_t rhs[ORIGAMI_MAX_FLAT_M], W[ORIGAMI_MAX_FLAT_O];
 
     for(int outer=0; outer<4096; outer++){
+#ifdef ORIGAMI_MEASURE
+        metric_outer_passes++;
+#endif
         memset(secret_y,0,sizeof(secret_y));
         int ok=1;
         for(int zone=0; zone<ORIGAMI_TOTAL_ZONES && ok; zone++){
@@ -164,8 +194,10 @@ static int forge(const ph_expanded_PK*pkx,uint8_t*sig,const uint8_t*digest,size_
             const int non_cnt=zn->n_offset+zn->flat_v;
             const int oil_start=zn->n_offset+zn->flat_v;
             const int64_t zbase=elig_before(z,zone);
+            /* Without vinegar, local retries repeat the same system. */
+            const int max_local_attempts=zn->flat_v>0?256:1;
             int solved=0;
-            for(int att=0; att<256 && !solved; att++){
+            for(int att=0; att<max_local_attempts && !solved; att++){
                 /* choose this zone's vinegar freely (any values) */
                 gf_stream_t vs; gf_stream_init(&vs,pkx->pk_seed,SEED_LENGTH_PUBLIC,"forge-vin",
                                                (uint32_t)zone,(uint32_t)att,(uint32_t)outer,NULL,0);
@@ -193,7 +225,13 @@ static int forge(const ph_expanded_PK*pkx,uint8_t*sig,const uint8_t*digest,size_
                     solved=1;
                 }
             }
-            if(!solved) ok=0;
+            if(!solved){
+#ifdef ORIGAMI_MEASURE
+                if(zn->flat_v==0) metric_tail_restarts++;
+                else metric_main_restarts++;
+#endif
+                ok=0;
+            }
         }
         if(!ok) continue;
         /* internal -> public coordinates via the PUBLIC permutation, then serialise */
@@ -220,10 +258,33 @@ static int unhex(uint8_t*o,size_t n,const char*h){for(size_t i=0;i<n;i++){unsign
 static void puthex(const char*tag,const uint8_t*b,size_t n){printf("%s",tag);for(size_t i=0;i<n;i++)printf("%02X",b[i]);printf("\n");}
 
 static int forge_one(const uint8_t*pk,const uint8_t*digest,const uint8_t*salt,uint8_t*sig){
-    ph_expanded_PK pkx; if(ORIGAMI_NAMESPACE(pk_expand)(&pkx,pk)!=0) return -1;
+    ph_expanded_PK pkx;
+#ifdef ORIGAMI_MEASURE
+    double start=metric_now();
+#endif
+    if(ORIGAMI_NAMESPACE(pk_expand)(&pkx,pk)!=0) return -1;
     int rc=forge(&pkx,sig,digest,BYTES_DIGEST,salt);
-    ORIGAMI_NAMESPACE(pk_free)(&pkx); return rc;
+    ORIGAMI_NAMESPACE(pk_free)(&pkx);
+#ifdef ORIGAMI_MEASURE
+    metric_forge_seconds+=metric_now()-start;
+#endif
+    return rc;
 }
+
+#ifdef ORIGAMI_MEASURE
+static int measured_sig_verify(uint8_t*pk, unsigned long long pklen,
+                               uint8_t*sig, unsigned long long siglen,
+                               uint8_t*msg, unsigned long long msglen){
+    double start=metric_now();
+    int rc=sig_verify(pk,pklen,sig,siglen,msg,msglen);
+    double elapsed=metric_now()-start;
+    metric_verify_seconds+=elapsed;
+    metric_verify_calls++;
+    if(rc==0){metric_verify_accepted_seconds+=elapsed;metric_verify_accepted_calls++;}
+    return rc;
+}
+#define sig_verify measured_sig_verify
+#endif
 
 DRNG_ctx drng_algorithm;  /* referenced by SIG_AlgorithmInstance.o; sig_verify never reads it */
 int main(int argc,char**argv){
@@ -242,7 +303,19 @@ int main(int argc,char**argv){
             int kr=sig_verify(pk,BYTES_PK,kat,BYTES_SIGNATURE,msg,(unsigned long long)mlen);
             printf("  KAT Sn under regenerated pk = %d (%s -> pk is the KAT keypair); forged==KAT ? %s\n",
                    kr,kr==0?"verifies":"FAILS",memcmp(kat,sig,BYTES_SIGNATURE)==0?"YES (replay!)":"NO (a new signature)"); } }
+        if(argc>=6){
+            uint8_t kat_pk[BYTES_PK];
+            if(strlen(argv[5])!=2*BYTES_PK || unhex(kat_pk,BYTES_PK,argv[5])){
+                fprintf(stderr,"bad KAT pk hex\n");return 1;
+            }
+            int same=memcmp(kat_pk,pk,BYTES_PK)==0;
+            printf("  KAT pk matches regenerated pk = %s\n",same?"YES":"NO");
+            if(!same) return 2;
+        }
         puthex("forged Sn = ",sig,BYTES_SIGNATURE);
+#ifdef ORIGAMI_MEASURE
+        metric_print();
+#endif
         return rc==0?0:2;
     }
     long K=argc>1?atol(argv[1]):100, MSGS=argc>2?atol(argv[2]):3;
@@ -268,5 +341,8 @@ int main(int argc,char**argv){
     printf("%s  keys=%ld msgs/key=%ld  forged_accepted=%ld/%ld  keyfail=%ld\n",ALGSTR,K,MSGS,ok,tot,keyfail);
     printf("  negative controls (must all reject): A_sig=%ld/%ld B_salt=%ld/%ld C_othermsg=%ld/%ld  [FALSE-ACCEPTS A=%ld B=%ld C=%ld]\n",
            ncA,ok,ncB,ok,ncC,ok,badA,badB,badC);
+#ifdef ORIGAMI_MEASURE
+    metric_print();
+#endif
     return (ok==tot && badA==0 && badB==0 && badC==0)?0:2;
 }
